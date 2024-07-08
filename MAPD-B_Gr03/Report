@@ -1,0 +1,1764 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Anomaly detection and predictive maintenance for industrial devices"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Group 3\n",
+    "\n",
+    "| Name   | ID |\n",
+    "| -------- | ------- |\n",
+    "| Braidi Federico  | 2122169    |\n",
+    "| Calandra Buonaura Lorenzo | 2107761     |\n",
+    "| Malagoli Pietro    | 2125711    |\n",
+    "| Turci Andrea  |2106724   |"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Introduction"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Nowadays, it has become of paramount importance for companies to collect a huge amount of data about their products. These data can have many applications depending on their type and quality and can empower the company itself to refine their products or to offer new services (i.e. predictive maintenance).\n",
+    "\n",
+    "The dataset we work with in this project is a slice of a dataset produced by a refrigeration company, collected by the sensors present on the machines they sell. Our goal is divided in 2 main parts:\n",
+    "\n",
+    "- **Anomaly detection:** we want to identify anomalies in the collected data which could be correlated with problems during installation, deterioration of machine parts or bad external conditions. Here we consider as anomalies frequent turn on/off of engines and their overuse/underuse.\n",
+    "\n",
+    "- **Predictive Maintenance:** once anomalies are detected, we want to find correlations between them and other measured metrics. These correlations can help us understand what might produce the malfunctionings and correct possible problems in design/installation and at the same time predict faults by focusing on the correlated features in the database, providing predictive maintenance."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Dataset"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The dataset we are provided with is part of a much bigger dataset from a company in the field of refrigeration. Let's inspect the structure of it by looking at an example record:\n",
+    "<center>\n",
+    "\n",
+    "| when | hwid | metric | value |\n",
+    "|------|------|--------|-------|\n",
+    "|1601510485159|SW-065|SA4|0|\n",
+    "\n",
+    "</center>\n",
+    "\n",
+    "\n",
+    "- The first column, `when`, contains the time of the measurement in the UNIX timestamp format; it indicates the number of milliseconds since January 1st 1970. It is saved as an int64.\n",
+    "\n",
+    "- The second column, `hwid`, reports the ID of the machine (also called hardware): there are four of them in our dataset (SW-065, SW-088, SW-106, SW-115).\n",
+    "\n",
+    "- The third column, `metric`, contains the name of the measured metric. In the dataset, we have 133 metrics and a provided table explains what every metric refers to (i. e. which sensor the metric records the value of).\n",
+    "\n",
+    "- The fourth column, `value`, reports the value of the measured metric. Depending on the metric, it can be an int64, a float or a binary value (i.e. we have a float for a temperature, an integer for the states of the alarms and a binary for a state of sensor). All the info about the number of decimals and the unit of measurement are contained in the same table provided along with the dataset. \n",
+    "\n",
+    "Below, we show an example of a record:\n",
+    "\n",
+    "<center>\n",
+    "\n",
+    "| Name | Description | UDM | Decimals |\n",
+    "|------|------|--------|-------|\n",
+    "|S70|Recovery Pump Signal|V|1.0|\n",
+    "\n",
+    "</center>"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Tasks"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Our work is divided in 3 main parts:\n",
+    "\n",
+    "1. Analysis of engine turn-on/turn-off rate and correlation with other metrics\n",
+    "\n",
+    "2. Analysis of engine working percentage and correlation with external temperature\n",
+    "\n",
+    "3. Analysis of machine circuit alarms and faults\n",
+    "\n",
+    "Before addressing each task, we need to have a normalized dataset, which is a transversal task."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### Normalization of the dataset"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For any of the correlation parts of the tasks, we need the data to be normalized to the same sampling frequency. This is necessary because, otherwise, we would have vectors of different lengths and each point in the two vectors would most likely not refer to the same time, making the search for correlations very hard.\n",
+    "\n",
+    "As we will see in the following parts, for every machine and metric, we group records based on which minute, with respect to the beginning of the measurements, they belong to. The aggregation function for the `value` column is decided based on the nature of the metric: for float valued metrics we can use the mean, but for integer (or binary) valued ones we can choose between other aggregation functions, like the maximum, the minimum or the sum. Finally, missing minutes are filled in with values generated by repeating the last seen value or a specific value chosen a priori."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 1. Engine turn-on/turn-off"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Every machine in the dataset works thanks to 4 motors. Each of these engines sends a ping to the database, usually every 30/60s, via the metrics S117, S118, S169, S170 (for motors 1, 2, 3, 4 respectively). A high frequency of engine turn-on/turn-off might be a sign of issues during installation, bad external conditions or deterioration of some parts of the machines; thus, this condition is what defines an anomaly for this specific task.\n",
+    "\n",
+    "We need to identify when these anomalies happen by looking at the periods where the motors are on or off and confronting them with the usual sampling time (usually between 30 and 60 seconds). For example, we have a typical anomaly when we have an upstate that lasts 30 seconds between downstates that last much longer. This behaviour is classified as an anomaly because it means that the engine was off for most of the period and turned on only for 30 seconds or less: this is an obvious indication that something triggered the engine, making it change its state. When these anomalies happen frequently, the engine doesn't work correctly anymore. \n",
+    "\n",
+    "Once we identify the anomalies, we need to conduct a correlation study between the motor-state metric and other metrics in the dataset; this study helps us understand if another metric is the cause of the anomaly or rather it is affected by it. Due to possible latency in the sensor system, it's also necessary to check for time-shifted correlations, to prove eventual causal relations. \n",
+    "\n",
+    "We don't have a prior knowledge of how the metrics are related to each others, except for their names. For this reason, we don't possess a strategy to look for correlations between some specific metric. Moreover, not all the metrics are relevant to all the engines. Thus, we conduct a selection of the metrics, in order to reduce the total number of combinations of metrics used for the study, based on the following criteria:\n",
+    "- Each hardware presents two circuits and four motors (each circuit has two motors); motors S117 and S118 are related to Circuit 1, while motors S169 and S170 to Circuit 2. For this reason, we first divide the metrics between Circuit-1-related metrics, Circuit-2-related metrics and general metrics. As an exception to this rule, metric S109 is only related to motor S117, metric S110 to motor S118, metric S166 to motor S169 and metric S167 to motor S170. Therefore, these last four metrics are considered only for correlations to the correspondent motor. \n",
+    "- We don't study the correlations with metrics S181 and S125 and with the alarms A5 and A9, which will be better analyzed later (in task 2 and 3 respectively).\n",
+    "- Finally, we neglect the metrics that are constant with respect to a specific hardware, since no correlation would arise.\n",
+    "\n",
+    "Thus, we can summarize in this table the circuit-independent metrics that have been studied for each hardware:\n",
+    "\n",
+    "|                      | SW-065  | SW-088  | SW-106  | SW-115  | \n",
+    "|----------------------|------------------|------------------|------------------|------------------|\n",
+    "| External Metric       | S10,S33,S39,S40,S41,S5,S53   |  P1,P2,S10,S25,S33,S35, S37,S39,S40,S41,S46,S47,S5, S53,S55,S6,S64,S7,S70,S8,S9   | P1,P2,S10,S33,S35,S37, S39,S40,S41,S46,S47,S5,S53, S55,S6,S64,S7,S70,S8,S9   | P1,S10,S33,S37,S39,S40, S41,S46,S47,S5,S53, S55,S6,S7,S70,S8,S9    |\n",
+    "\n",
+    "The following table shows instead the circuit-related metrics that we considered for the correlation analysis (present on each hardware):\n",
+    "\n",
+    "|                | Circuit 1 (S117,S118) | Circuit 2 (S169,S170) | \n",
+    "|----------------------|------|------|\n",
+    "| Binary metrics | S112, S113,S114,S115,S123,S127,S201,S202,S203,S73    | S130,S171,S172,S173,S174,S179,S183,S204,S205,S206    |\n",
+    "| Non-binary metrics| S100,S101,S102,S106,S107,S108,S122,S124,S126    |  S157,S158,S159,S163,S164,S165,S178,S180   |\n",
+    "\n",
+    "Finally, we also need to consider the engine-specific metrics (present on each hardware):\n",
+    "|                | S117 | S118 | S169 | S170 | \n",
+    "|----------------------|------|------|------|------|\n",
+    "| Engine-specific metric               | S109    | S110    | S166    | S167    |\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "After this initial division, we need to choose which type of correlation we want to investigate and the relative algorithm; due to the absence of prior knowledge, we have several possibilities:\n",
+    "- **Pearson correlation coefficient**: this correlation coefficient measures linear correlation between two sets of data, defined as the ratio between the covariance of two variables and the product of their standard deviations. Thus, it gives a measurement of the covariance, and returns a result between -1 and 1. For this reason, it can only reflect a linear correlation of variables, and ignores many other types of relationships.\n",
+    "- **Spearman correlation coefficient**: this coefficient assesses how well the relationship between two variables can be described using a monotonic function, whether linear or not, differently from Pearson's coefficient.\n",
+    "- **Kendall correlation coefficient**: this coefficient is used to measure the ordinal association between two measured quantities. Similarly to Spearman coefficient, it studies a ranked relationship between the two sets of data and it's not limited to linear model only.\n",
+    "\n",
+    "We decided to choose all of the above-mentioned techniques in order to avoid biases in the correlation study (for example limiting the study to linear correlations). Moreover, we opted for these coefficients as a measure of correlation because they are able to capture small changes in the behaviour of the metrics. Thus, they are able to provide correlations between the state of an engine when an anomlay occurs and the state or the trend behaviour of other metrics.\n",
+    "\n",
+    "As will be presented later, the total number of anomalies in the dataset is much smaller than the total number of records for a given engine; thus, in addition to a total correlation, which compares all the values for two metrics looking for a global dependency, we decided to study also the correlation coefficients in the neighbourhood of each anomaly. The main reason behind this strategy is that the dataset covers a six-month period and so it is not probable to have a correlation between an engine anomaly and a metric record registred in times far from each other. In this way, we restrict the number of records we consider for the study, which helps understanding if there is a local correlation given by the anomalies even if a global correlation between the engine and the metric is not present."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 2. Engine working percentage"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As previously said, the motors associated with metrics S117 and S118 are part of Circuit 1 while those associated to metrics S169 and S170 are part of Circuit 2. Each circuit has an associated metric that describes the working percentage of its motors, relative to the maximum work load that the motors can manage (S125 for Circuit 1 and S181 for Ciruit 2). Studying this data series can help us discover signs of deteriorated parts, bad external conditions or even design flaws (over/under dimensioned engines).\n",
+    "\n",
+    "The aim of this task is double: first, look for any high or low workload in the motors, in order to detect a possible failure, and second, find correlations, if there are any, between these working percentages and the external temperature, stored in metric S41."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 3. Engine circuit alarms"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In our dataset, two metrics are stored differently from the others, A5 and A9, which are used to convey 16 alarm signals of a circuit (A5 for circuit 1 and A9 for circuit 2). The binary values of these sensors (1 for error and 0 for no error) are concatenated and tranformed to decimal, obtaining a number in the range 0-65535, which becomes the value of the A5/A9 metric. This technique is frequently used in industrial applications (such as this one) because, due to the high amount of sensors on a single machine part, it's much more beneficial to store only 1 integer value rather than all the binary values.\n",
+    "\n",
+    "For this part, we need to convert back the values to the 16 flags and consider a malfunctioning, which indicates overheating, if any of the 6, 7, 8 positioned bits are set to 1. Then, we look for correlations between the series of values for each bit (each alarm) and other variables in the dataset to possibly identify why these faults happened. Furthermore, we need to check for correlations between the malfunctionings as a whole and other variables. These correlations should be time-shifted, because we expect a causal relation (the condition happens thus a fault is registered). This means that we would like to find some metric which behaviour allows us to predict future faults (which is the core principle of predictive maintenance)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Code"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For the code part, we created a library **aux.py** which contains all our functions, and used notebooks to call them and visualize the results. We will now proceed to explain the functions we created and the ones we used from other libraries, ordered by their apparence in the project."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Cluster creation\n",
+    "\n",
+    "First of all, we had to setup the cluster and connect to it. To do so, we used the `SSHCluster` function of `dask.distributed`:\n",
+    "\n",
+    "```python \n",
+    "cluster = SSHCluster([\"localhost\", \"localhost\", \"10.67.22.61\", \"10.67.22.67\"],connect_options={\"password\":\"********\",\"username\":\"*******\"},scheduler_options={\"port\": 0, \"dashboard_address\": \":8787\"})\n",
+    "```\n",
+    "\n",
+    "This function is called from the 10.67.22.165 machine, which we adopted as the head of the cluster. It creates a cluster with localhost as its head, and 3 attached machines: localhost itself, 10.67.22.61 and 10.67.22.67. The cluster is created using one of our credentials and it sets up the scheduler's dashboard on port 8787, if it is not already occupied.\n",
+    "\n",
+    "Any time someone wants to run code on the cluster, they need to check wether one is already up by looking at the dashboard at port 8787 of the machine (this can be done by connecting the local computer's 8787 port to 10.67.22.165 with an ssh command). Once a cluster is up, one can connect any notebook to it by creating a dask Client object using the command:\n",
+    "\n",
+    "```python\n",
+    "client = Client('10.67.22.165:*port*')\n",
+    "```\n",
+    "\n",
+    "where *port* needs to be substituted by the port shown in the INFO section of the dashboard."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Data Import\n",
+    "\n",
+    "The next step is importing the data from the provided file. We decided to work with dataframes and, because of that, we had to keep the file in .csv unzipped form to make it readable to a Dask Dataframe. To avoid storing multiple unzipped copies of a 5 Gb file and filling up the memory, we created a common folder, outside our personal user folders on every machine, containing a copy of the .csv file. At the beginning of a notebook, we usually imported it like:\n",
+    "\n",
+    "```python\n",
+    "path=os.path.abspath('/home/data/data.csv')\n",
+    "\n",
+    "df = dd.read_csv(path)\n",
+    "df.head()\n",
+    "```\n",
+    "\n",
+    "where we used the `os` Python library and imported dask.dataframes as `dd`."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Task 1\n",
+    "\n",
+    "The first part of Task 1 is about finding the anomalies in the metrics that represent the state of the 4 motors present in each hardware. As explained, we define an anomaly as a period of \"on-time\" or \"off-time\" that lasts 1 minute or less. To find the anomalies, we wrote some functions, which we split if a mid-product of the computing process is needed:\n",
+    "\n",
+    "```python\n",
+    "def aggregate_up_down(df, hwid, metric):\n",
+    "\n",
+    "    selection=df[df['hwid']==hwid]\n",
+    "    selection=selection[selection['metric']==metric].compute()  \n",
+    "\n",
+    "    selection['switch']=selection['value'].diff().map(abs).map(lambda x: True if x==1 or math.isnan(x) else False)\n",
+    "    selection=selection[selection['switch']]\n",
+    "    selection['times']=selection['when'].diff()/1000/60\n",
+    "    selection['value']=selection['value'].map(lambda x: 0 if x==1 else 1)\n",
+    "    times=list(selection['times'])[1:]\n",
+    "    values=list(selection['value'])[1:]\n",
+    "    history=[[value,time] for value,time in zip(values,times)]\n",
+    "\n",
+    "    return history\n",
+    "```\n",
+    "The `aggregate_up_down()` function takes a Dask Dataframe (`df`), an hardware id (`hwid`) and a metric label (`metric`) as inputs. It then filters `df` to only keep the rows relative to the given hardware and metric and computes to get a Pandas Dataframe. We do this here because the filtered dataframe is small enough to fit comfortably in memory and the `diff` function that we use on it later is more efficient on pandas dataframes because of the absence of partition boundaries. Later, we create a new column which is set to `True` if the absolute value of the difference between the current row's value and the previous one is 1 (i.e. if there's a switch in the motor's state), `False` otherwise.\n",
+    "\n",
+    "A new column `times` is created as the result of the `diff()` of the `when` column, then converted into minutes; this way, we have a column of the periods of up-time and down-time, alternated. Due to how the `diff()` function calculates the difference, the values in the `value` column are inverted with respects to the real ones, so we flip them (invert 0-1). \n",
+    "\n",
+    "Finally, we get the periods (`times`) and the machine states (`values`) and combine them into a list where each element is composed of:\n",
+    "- machine state.\n",
+    "- period of time for which the motor has remained in that state.\n",
+    "\n",
+    "which is the returned.\n",
+    "\n",
+    "```python\n",
+    "def getuniquecouples(df):\n",
+    "    g=df.groupby(['hwid','metric']).mean().compute()\n",
+    "    hwids=list(g.index.get_level_values('hwid'))\n",
+    "    metrics=list(g.index.get_level_values('metric'))\n",
+    "    combos=zip(hwids,metrics)\n",
+    "    combos=sorted(combos,key=lambda x:x[0])\n",
+    "    \n",
+    "    return combos\n",
+    "```\n",
+    "\n",
+    "This function takes as input a Dask Dataframe and finds all the couples (of hardware and metric) present by grouping on those columns and extracting the grouped indexes. These two vectors are then zipped to preserve the order and sorted according to the hardware id. This is done in order to use the result in for loops and avoid checking non-existing couples that would result in empy Dataframes.\n",
+    "\n",
+    "Finally, the last function we used to get the number of anomalies for each metric and hardware is:\n",
+    "\n",
+    "```python\n",
+    "def find_anomaly_number(df):\n",
+    "\n",
+    "    zipped=getuniquecouples(df)\n",
+    "\n",
+    "    limitlow=(30+1)/60\n",
+    "    limithigh=(60+1)/60\n",
+    "\n",
+    "    for hw,metric in zipped:\n",
+    "            print(f\"hw: {hw} metric: {metric}\")\n",
+    "            \n",
+    "            agg=aux.aggregate_up_down(df,hw,metric)\n",
+    "            \n",
+    "            times=[el[1] for el in agg]\n",
+    "            zeros=[x for x in times if x==0]\n",
+    "            between=[x for x in times if (x>limitlow and x<limithigh)]\n",
+    "            low=[x for x in times if (x>0 and x<limitlow)]\n",
+    "\n",
+    "            print(f\"The instances of 1 single isolated uptime or downtime reading are: {len(zeros)}\")\n",
+    "            print(f\"The instances of uptimes or downtimes between 30 sec and 1 min are: {len(between)}\")\n",
+    "            print(f\"The instances of <30 seconds uptimes or downtimes are: {len(low)}\")\n",
+    "```\n",
+    "\n",
+    "This function is given a Dask Dataframe (in our case the imported `df` filtered on metrics 'S117','S118','S169','S170'). It first calls the function `getuniquecouples()` that returns the existing hardware-metric couples. We then define two thresholds: one at 30 seconds and one at 60, decided on the basis of the sampling frequencies in the dataset. We define them as (30+1)/60 and (60+1)/60 to include those that should be at 30 and 60 seconds but are actually some milliseconds longer. Finally, for each combination of hardware and metric, we call the `aggregate_up_down()` function and count how many 0s/0-30s/30-60s intervals we find. \n",
+    "\n",
+    "In the second part, we want to find correlations between the on-off variables relative to the motors and other variables in the dataset. We move on two fronts: checking global relations between the behaviour of the engines and other metrics, and checking local correlations in the neighbourhood of the anomalies. As explained in the introduction part, to test correlations we employed 3 methods: Pearson's, Spearman's and Kendall's coefficients. All of these techniques require the two compared data vectors to be of the same length and, in order to give a meaningful result, to have points relative to the same time. To do so, we need to normalize our measurements, which we do by using the following functions:\n",
+    "\n",
+    "```python\n",
+    "def get_norm_data(df,hwid,metric,aggfunc='mean'):\n",
+    "    selection=df[df['hwid']==hwid]\n",
+    "    selection=selection[selection['metric']==metric]\n",
+    "    selection['minute']=selection['when'].map(lambda x: int((x - 1601510422405) / 60000),meta=('when','int64'))\n",
+    "\n",
+    "    if aggfunc=='mean':\n",
+    "        g = selection.groupby(['hwid', 'metric', 'minute']).mean().compute().sort_values(by='minute')\n",
+    "    elif aggfunc=='max':\n",
+    "        g = selection.groupby(['hwid', 'metric', 'minute']).max().compute().sort_values(by='minute')\n",
+    "    elif aggfunc=='min':\n",
+    "        g = selection.groupby(['hwid', 'metric', 'minute']).min().compute().sort_values(by='minute')\n",
+    "    elif aggfunc=='sum':\n",
+    "        g = selection.groupby(['hwid', 'metric', 'minute']).sum().compute().sort_values(by='minute')\n",
+    "    else:\n",
+    "        raise ValueError('Non supported aggfunction')\n",
+    "\n",
+    "    minutes=list(g.index.get_level_values('minute'))\n",
+    "\n",
+    "    return list(g['value']),minutes\n",
+    "```\n",
+    "\n",
+    "This function is designed to be used to normalize the values of one of the possibly correlated metrics, before checking. It takes a Dataframe, the hardware, the metric and an aggregation function. It then filters the Dataframe with the hardware and the metric and adds a column `minute` that contains the minute (from the first value of `when` present in the dataset) which the measurement belongs to. The dataframe is finally grouped by this new column (together with the hardware and the metric), the selected aggregation function is applied to `when` and `value` and it is computed and sorted with respects to `minute`. In the end, the function returns the `value` column as a list and the parallel `minute` column which will be useful in calling the next function.\n",
+    "\n",
+    "```python\n",
+    "def fill_missing_min(values,minutes):\n",
+    "\n",
+    "    tmax=max(minutes)\n",
+    "    lastvalue=0\n",
+    "    fmin=minutes.copy()\n",
+    "    fvals=values.copy()\n",
+    "\n",
+    "    for i in range(1,tmax):\n",
+    "        if i not in minutes:\n",
+    "            fmin.append(i)\n",
+    "            fvals.append(lastvalue)\n",
+    "        else:\n",
+    "            index=minutes.index(i)\n",
+    "            lastvalue=fvals[index]\n",
+    "\n",
+    "    _, filled_values = zip(*sorted(zip(fmin, fvals)))\n",
+    "\n",
+    "    return list(filled_values)\n",
+    "```\n",
+    "\n",
+    "This function is needed for filling values in the minutes that are missing from the measurements. In this case, we decided to fill values copying from the last seen value, supposing that when we have no news from a certain metric it remains constant. This function takes as inputs the outputs of the previous one and goes through them looking for missing minutes. Subsequently, it fills the minutes and the value in the corresponding vectors and sorts them with respects to the minutes.\n",
+    "\n",
+    "The process is slightly different for the metric of the engine itself because we need to create a new `anomaly` column as a flag of whether or not a certain record is part of an anomaly and then normalize and fill both the `value` and `anomaly` columns. With that said, we define some new functions, similar to the previous ones:\n",
+    "\n",
+    "```python\n",
+    "def fill_missing_anomaly(anomalies, values, minutes):\n",
+    "\n",
+    "    tmax=int(max(minutes))\n",
+    "    lastvalue=0\n",
+    "    fmin=minutes.copy()\n",
+    "    fvals=values.copy()\n",
+    "    fanom=anomalies.copy()\n",
+    "\n",
+    "    for i in range(1,tmax):\n",
+    "        if i not in minutes:\n",
+    "            fmin.append(i)\n",
+    "            fvals.append(lastvalue)\n",
+    "            fanom.append(0)\n",
+    "        else:\n",
+    "            index=minutes.index(i)\n",
+    "            lastvalue=fvals[index]\n",
+    "\n",
+    "    _, filled_values, filled_anomalies = zip(*sorted(zip(fmin, fvals, fanom)))\n",
+    "\n",
+    "    return list(filled_values), list(filled_anomalies)\n",
+    "```\n",
+    "\n",
+    "This one takes an anomaly, a value and a minutes column (in list form), checks for missing minutes and, for each, inserts a 0 value (in the anomalies) and copies the last number seen for the values.The difference in the filling of the anomalies is due to our decision to avoid supposing an anomaly can occurr during a missing data period. The function finally returns both the values and anomalies filled lists.\n",
+    "\n",
+    "```python\n",
+    "def get_norm_val_anom(df, hwid, metric, aggfunc='mean'):\n",
+    "  \n",
+    "  def is_within_intervals(value, intervals):\t\n",
+    "      for interval in intervals:\n",
+    "          if int(interval[0]) <= value <= int(interval[1]):\n",
+    "              return 1\n",
+    "      return 0\n",
+    "\n",
+    "  history=aux.aggregate_up_down(df,hwid,metric)\n",
+    "\n",
+    "  history_new=[int(x[1]*60000) for x in history]\n",
+    "\n",
+    "  selection=df[df['hwid']==hwid]\n",
+    "  selection=selection[selection['metric']==metric]\n",
+    "\n",
+    "  initial_time=selection['when'].min().compute()\n",
+    "\n",
+    "  a=[(initial_time+sum(history_new[:i]),initial_time+sum(history_new[:i+1])) for i,x in enumerate(history_new) if x < (60+1)*1000]\n",
+    "\n",
+    "  selection['minute']=selection['when'].map(lambda x: int((x - 1601510422405) / 60000),meta=('when','int64'))\n",
+    "\n",
+    "  selection['anomaly']=selection['when'].map(lambda x: is_within_intervals(x, a), meta=('anomaly', 'int'))\n",
+    "\n",
+    "  agg_dict = {'value': aggfunc, 'anomaly': 'max'}\n",
+    "  g = selection.groupby(['hwid', 'metric', 'minute']).agg(agg_dict).compute().sort_values(by='minute')\n",
+    "\n",
+    "  minutes=list(g.index.get_level_values('minute'))\n",
+    "  anomaly = list(g['anomaly'])\n",
+    "  value = list(g['value'])\n",
+    "\n",
+    "  filled_val, filled_anom = aux.fill_missing_anomaly(anomaly, value, minutes)\n",
+    "  \n",
+    "  time = np.arange(0,len(filled_anom))\n",
+    "\n",
+    "  return time, filled_anom, filled_val\n",
+    "```\n",
+    "\n",
+    "This function takes as input a dataframe, an hardware id, a metric and an aggregation function. It first calls the function `aggregate_up_down()`, transforms the on-off periods into milliseconds and filters the dataset on the given metric and hardware. It then calculates the initial and final time (`initial_time`,`final_time`) of the anomalies periods (i.e. for periods of lenght < (60+1)x1000 ms) and creates a new column `anomaly` by applying the `is_within_intervals()` function, which returns `True` if a recors is inside of one of the intervals, `False` otherwise.\n",
+    "\n",
+    "After that, it adds a `minute` column, groupes on it (together with hardware id and metric) and applies a max aggregation function over `anomaly` and the desired aggregation function over `values`. Finally the Dataframe is computed, the columns are transformed into lists and the `filling_missing_anomaly()` function is called. In the end, the function returns the 3 vectors `time`, `filled_anom` and `filled_val`.\n",
+    "\n",
+    "To complete the analysis, for each hardware and motor metric, we normalize and fill the possibly-correlated metrics listed in the Introduction section, using the `get_norm_data()` and `fill_missing_min()` functions and we append them to a list `metric_list()`. We then normalize and fill the hardware-metric of interest with `get_norm_val_anom()` and `fill_missing_anom()` functions.\n",
+    "\n",
+    "We call the following function with engine being the normalized and filled hardware-metric vector, `metric_list` being the just-defined list of filled vectors and `window` being the one-sided lenght of the slice to be taken around the anomaly. \n",
+    "\n",
+    "\n",
+    "```python\n",
+    "def corr_finder(engine, metric_list, window):\n",
+    "    \n",
+    "    corr_coeff_pearson = []\n",
+    "    corr_coeff_spearman = []\n",
+    "    corr_coeff_kendall = []\n",
+    "    tot_corr_coeff = []\n",
+    "\n",
+    "    for k in range(len(metric_list)):\n",
+    "        corr_coeff_pearson.append([])\n",
+    "        corr_coeff_spearman.append([])\n",
+    "        corr_coeff_kendall.append([])\n",
+    "\n",
+    "    for metric in metric_list:\n",
+    "        dftot = pd.DataFrame({'values_engine': list(engine.iloc[:,2]), 'values_metric': list(metric.iloc[:,1])})\n",
+    "        corrs = [dftot.corr(method='pearson').iloc[0,1],dftot.corr(method='spearman').iloc[0,1],dftot.corr(method='kendall').iloc[0,1]]\n",
+    "        tot_corr_coeff.append(corrs)\n",
+    "\n",
+    "    for i in range(len(engine['Anomaly'])):\n",
+    "        if engine.iloc[i,1]:\n",
+    "            values_engine = list(engine.iloc[i-window:i+window+1,2])\n",
+    "            for j,metric in enumerate(metric_list):\n",
+    "                values_metric = list(metric.iloc[i-window:i+window+1,1])\n",
+    "\n",
+    "                df = pd.DataFrame({'values_engine': values_engine, 'values_metric': values_metric})\n",
+    "                corr_coeff_pearson[j].append(df.corr(method='pearson').iloc[0, 1])\n",
+    "                corr_coeff_spearman[j].append(df.corr(method='spearman').iloc[0, 1])\n",
+    "                corr_coeff_kendall[j].append(df.corr(method='kendall').iloc[0, 1])\n",
+    "    return corr_coeff_pearson,corr_coeff_spearman,corr_coeff_kendall,tot_corr_coeff\n",
+    "```\n",
+    "\n",
+    "As we can see this function defines 4 lists: 1 for each of the local correlations and 1 for the global ones. A first for loop checks for global correlations between `engine` and any of the metrics in `metric_list`. The second for loop spans the whole 'anomaly' column and, when it finds a 1 (presence of an anomaly), takes the neighbouring slice of `engine` and of every `metric` in `metric_list`, puts them in couples into dataframes and uses the `.corr()` function to calculate the three types of correlations. Finally the lists are returned for further analysis and visualization."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Task 2\n",
+    "\n",
+    "The first part of this task involves checking for signs of under/over-dimensioned machines, deteriorated parts or unsuitable external conditions by analyzing the metrics 'S125' and 'S181'. Later, we will try to find correlations between them and the external temperature metric, 'S41'.\n",
+    "\n",
+    "To tackle the first objective we iterate through the hardwares (`hwids=['SW-065','SW-088','SW-106','SW-115']`) and the metrics (`metrics=['S125','S181']`) using the code below. For each combination, we normalize and fill the measurements with the appropriate functions and print the active and maximum capacity hours with respects to the total measurement hours.\n",
+    "\n",
+    "```python\n",
+    "for hw in hwids:\n",
+    "    for metric in metrics:\n",
+    "        perc_val,perc_min=aux.get_norm_data(df,hw,metric)\n",
+    "        perc_fill=aux.fill_missing_min(perc_val,perc_min)\n",
+    "\n",
+    "        total_hours=len(perc_fill)/60\n",
+    "        active_hours=len([x for x in perc_fill if x!=0])/60\n",
+    "        max_hours=len([x for x in perc_fill if x==100])/60\n",
+    "\n",
+    "        print('############')\n",
+    "        print(f'Analyzing the active time of metric {metric} for machine {hw}')\n",
+    "        print(f'The circuit is active for a total of {active_hours} over {total_hours}\\\n",
+    "             of measurements ({active_hours/total_hours*100}% of the measurement time).')\n",
+    "        print(f'The circuit runs at max capacity for {max_hours} hours ({max_hours/total_hours*100}% of the measurement time).')\n",
+    "```\n",
+    "\n",
+    "For the second step we just need to iterate through the hardwares, normalize and fill the 'S125', 'S181' and 'S41' metrics. We then cut them to be of the same length (it might be the case that both metrics don't have their last measurement on the same minute), arrange them in Dataframes and calculate the 3 global correlations. \n",
+    "\n",
+    "```python\n",
+    "for hw in hwids:\n",
+    "    load1_val,load1_min=get_norm_data(df,hw,'S125')\n",
+    "    load1_fill=fill_missing_min(load1_val,load1_min)\n",
+    "    load2_val,load2_min=get_norm_data(df,hw,'S181')\n",
+    "    load2_fill=fill_missing_min(load2_val,load2_min)\n",
+    "    temp_val,temp_min=get_norm_data(df,hw,'S41')\n",
+    "    temp_fill=fill_missing_min(temp_val,temp_min)\n",
+    "    temp_fill_min=np.arange(0,len(temp_fill))\n",
+    "\n",
+    "    min1=min(len(temp_fill),len(load1_fill))\n",
+    "    min2=min(len(temp_fill),len(load2_fill))\n",
+    "\n",
+    "    df1=pd.DataFrame({'S41':temp_fill[:min1],'S125':load1_fill[:min1]})\n",
+    "    df2=pd.DataFrame({'S41':temp_fill[:min2],'S181':load2_fill[:min2]})\n",
+    "\n",
+    "    print(f\"Full correlations between S125 and S41 of machine {hw}:\\n\")\n",
+    "    print(f\"Pearson Correlation: {df1.corr(method='pearson').iloc[0,1]}\\n\")\n",
+    "    print(f\"Spearman Correlation: {df1.corr(method='spearman').iloc[0,1]}\\n\")\n",
+    "    print(f\"Kendall Correlation: {df1.corr(method='kendall').iloc[0,1]}\\n\")\n",
+    "    print(f\"Full correlations between S181 and S41 of machine {hw}:\\n\")\n",
+    "    print(f\"Pearson Correlation: {df2.corr(method='pearson').iloc[0,1]}\\n\")\n",
+    "    print(f\"Spearman Correlation: {df2.corr(method='spearman').iloc[0,1]}\\n\")\n",
+    "    print(f\"Kendall Correlation: {df2.corr(method='kendall').iloc[0,1]}\\n\")\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Task 3\n",
+    "\n",
+    "The first step for this task is to convert the values of the 'A5'/'A9' metrics to extract the signals from the different parts of the 1/2 circuit, respectively. Furthermore we want to flag a record with 1 if it contains an error on one or more of the 6/7/8 positioned bits. To do this, we define the follwing functions:\n",
+    "\n",
+    "```python\n",
+    "def check_fault(row,metric):\n",
+    "    return int((row[f'{metric}_6']==1) or (row[f'{metric}_7']==1) or (row[f'{metric}_8']==1))\n",
+    "```\n",
+    "\n",
+    "```python\n",
+    "def separate_readings(df,hwid,metric):\n",
+    "    selection=df[df['hwid']==hwid]\n",
+    "    selection=selection[selection['metric']==metric]\n",
+    "\n",
+    "    selection[f'{metric}_6']=selection['value'].apply(lambda value: int(((bin(value)[2:]).zfill(16))[-6]),meta=('value', 'int64'))\n",
+    "\n",
+    "    selection[f'{metric}_7']=selection['value'].apply(lambda value: int(((bin(value)[2:]).zfill(16))[-7]),meta=('value', 'int64'))\n",
+    "\n",
+    "    selection[f'{metric}_8']=selection['value'].apply(lambda value: int(((bin(value)[2:]).zfill(16))[-8]),meta=('value', 'int64'))\n",
+    "\n",
+    "    selection['minute']=selection['when'].map(lambda x: int((x - 1601510422405) / 60000),meta=('when','int64'))\n",
+    "\n",
+    "    agg_dict = {f'{metric}_6': 'max', f'{metric}_7': 'max', f'{metric}_8': 'max'}\n",
+    "    \n",
+    "    g = selection.groupby(['hwid', 'metric', 'minute']).agg(agg_dict).compute().sort_values(by='minute')\n",
+    "\n",
+    "    minutes=list(g.index.get_level_values('minute'))\n",
+    "    alarm6 = list(g[f'{metric}_6'])\n",
+    "    alarm7 = list(g[f'{metric}_7'])\n",
+    "    alarm8 = list(g[f'{metric}_8'])\n",
+    "\n",
+    "    tmax=int(max(minutes))\n",
+    "    fmin=minutes.copy()\n",
+    "    fvals6=alarm6.copy()\n",
+    "    fvals7=alarm7.copy()\n",
+    "    fvals8=alarm8.copy()\n",
+    "\n",
+    "    for i in range(1,tmax):\n",
+    "        if i not in minutes:\n",
+    "            fmin.append(i)\n",
+    "            fvals6.append(0)\n",
+    "            fvals7.append(0)\n",
+    "            fvals8.append(0)\n",
+    "\n",
+    "    _, filled_a6, filled_a7, filled_a8 = zip(*sorted(zip(fmin, fvals6, fvals7, fvals8)))\n",
+    "\n",
+    "    time = np.arange(0,len(filled_a7))\n",
+    "\n",
+    "    new_df = pd.DataFrame({'minute': time, f'{metric}_6': filled_a6, f'{metric}_7': filled_a7, f'{metric}_8': filled_a8})\n",
+    "    \n",
+    "    new_df['fault'] = new_df.apply(aux.check_fault,axis=1,args=(metric,))\n",
+    "    \n",
+    "    return new_df\n",
+    "```\n",
+    "\n",
+    "The function `separate_readings()` takes as input a Dask Dataframe, an hardware id and a metic ('A5'/'A9'). It then filters the dataframe and adds 3 columns, 1 for each of the bits we are interested in (6,7,8) obtained by converting the `value` column into binary and extracting the corresponding digits. After that it creates the `minute` column and groups on it with a `max()` aggregation function on the newly created bit columns: we use the max here because if a fault is present we want it to be still present after the normalization. The Dask Dataframe is then computed to get a Pandas one, the columns are extracted, filled with 0 when there are missing minutes (we suppose no errors when we don't have data) and put back together into a Dataframe. Finally, a new column `fault` is created calling the `check_fault()` function on the dataframe, which is basically an 'or' function between the bit columns.\n",
+    "\n",
+    "Just like in Task 1, we want to find both general correlations between the error signals and other metrics in the data and local ones in the neighbourhood of the errors themselves. To reach the goal of *predictive maintenance*, however, it is not enough to find these instantaneous correlations and we should look for shifted ones. Here we consider a shifted correlation to be present if a slice of data around the error in the error column is correlated with an equal but shifted back slice in the other metric's column. To be able to check for these types of correlations, we slightly modify the `corr_finder()` function we used earlier:\n",
+    "\n",
+    "```python\n",
+    "def corr_finder_shift(alarm, metric_list, window, shift):\n",
+    "    \n",
+    "    corr_coeff_pearson = []\n",
+    "    corr_coeff_spearman = []\n",
+    "    corr_coeff_kendall = []\n",
+    "    tot_corr_coeff = []\n",
+    "\n",
+    "    for k in range(len(metric_list)):\n",
+    "        corr_coeff_pearson.append([])\n",
+    "        corr_coeff_spearman.append([])\n",
+    "        corr_coeff_kendall.append([])\n",
+    "\n",
+    "    for metric in metric_list:\n",
+    "        max_length = min(len(alarm['minute']), len(metric['Minute']))\n",
+    "        dftot = pd.DataFrame({'values_alarm': list(alarm.iloc[:max_length,1]), 'values_metric': list(metric.iloc[:max_length,1])})\n",
+    "        corrs = [dftot.corr(method='pearson').iloc[0,1], dftot.corr(method='spearman').iloc[0,1], dftot.corr(method='kendall').iloc[0,1]]\n",
+    "        tot_corr_coeff.append(corrs)\n",
+    "\n",
+    "    for i in range(len(alarm['minute'])):\n",
+    "        if alarm.iloc[i,1]:\n",
+    "            if i-window-shift<0 or i+window>len(alarm['minute']):\n",
+    "                for j in range(len(metric_list)):\n",
+    "                    corr_coeff_pearson[j].append(0)\n",
+    "                    corr_coeff_spearman[j].append(0)\n",
+    "                    corr_coeff_kendall[j].append(0)\n",
+    "            else:\n",
+    "                start_index = i-window\n",
+    "                end_index = i+window\n",
+    "                values_alarm = list(alarm.iloc[start_index:end_index+1,1])\n",
+    "                for j,metric in enumerate(metric_list):\n",
+    "                    start_shifted = start_index-shift\n",
+    "                    end_shifted = end_index-shift\n",
+    "                    \n",
+    "                    values_metric = list(metric.iloc[start_shifted:end_shifted+1,1])\n",
+    "        \n",
+    "                    df = pd.DataFrame({'values_alarm': values_alarm, 'values_metric': values_metric})\n",
+    "                    corr_coeff_pearson[j].append(df.corr(method='pearson').iloc[0, 1])\n",
+    "                    corr_coeff_spearman[j].append(df.corr(method='spearman').iloc[0, 1])\n",
+    "                    corr_coeff_kendall[j].append(df.corr(method='kendall').iloc[0, 1])\n",
+    "                    \n",
+    "    return tot_corr_coeff,corr_coeff_pearson,corr_coeff_spearman,corr_coeff_kendall\n",
+    "```\n",
+    "\n",
+    "As we can see, we introduce a new parameter, `shift`, which indicates how big is the back shifting; moreover, before extracting the slices, we always check for the extremes, in order not to go out of the boundaries of the arrays, avoiding IndexOutOfBound Errors. "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Analysis"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Choice of cluster parameters"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The choice of the cluster's parameters is crucial for the performance of the system. There is no one-size-fits-all solution to which parameters to choose, they depend on the physical architecture, on the task at hand and on the way the functions that need to be run on the cluster are written.\n",
+    "\n",
+    "We focus our benchmark on 3 main parameters:\n",
+    "\n",
+    "- `nworkers`: as defined by Dask it is the number of workers hosted on each machine connected to the network.\n",
+    "\n",
+    "- `nthreads`: as defined by Dask it is the number of processes hosted on each worker.\n",
+    "\n",
+    "- `npartitions` / `blocksize`: they are the number of partitions the data is divided in and the size of each partition, respectively. They are connected by the relation `npartitions = datasetsize//blocksize`"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Dask automatically sets these parameters, if not given. The defaults are as follows:\n",
+    "\n",
+    "- `nworkers` defaults to 1, meaning we have as many workers as the number of machines attached to the network.\n",
+    "\n",
+    "- `nthreads` defaults to the number of available cores on the machines (4 in our case), meaning each machine has as many processes as it has cores (enabling further parallelization).\n",
+    "\n",
+    "- `blocksize` defaults to 64 MB, which is also the maximum value allowed, meaning we can't have less partitions than `size//64MB`. Our dataset being circa 5GB in dimension defaults to 79 partitions."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Our approach is to first leave the number of partitions to default and focus on `nworkers` and `nthreads`. We choose 4 of our functions, which are the ones that are most often used during the project, and we test their run time with many combinations of the parameters. The time is tested by using the %%timeit command in jupyter cells and every function is tried 10 times to obtain an average value. The tested functions are:\n",
+    "\n",
+    "```python\n",
+    "- aux.aggregate_up_down(df, 'SW-115', 'S117')\n",
+    "\n",
+    "- aux.getuniquecouples(df)\n",
+    "\n",
+    "- aux.get_norm_data(df,'SW-106','S118')\n",
+    "\n",
+    "- aux.separate_readings(df,'SW-088','A9')\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The obtained results can be seen in the following heatmap, where the value of a cell is determined by the sum of the computing times for the 4 functions for a specific `nworkers`-`nthreads` couple: "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt txt](images/bench_heatmap.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As we can see, the best results tend to be obtained by choosing `nthreads` to be equal to the number of cores on the machines (4). Among those we also see that it is more beneficial to keep `nworkers` to 1, so 1 worker per machine. From the plot it is obvious that the configuration with `nworkers=1` and `nthreads=8` is also very good in terms of computational efficiency; this might be the case because `nthreads` is twice the number of cores and there might be more sinergy than when trying with 6 or 7 (even if this effect can only be seen with `nworkers=1`). All in all, the best choices appear to be the default ones, with `nworkers=1` and `nthreads=4`; for this reason we move on to the analysis of `blocksize` keeping these parameters."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The analysis of the blocksize is carried out by importing the dataset with different values of the parameter in the read_csv function and benchmarking the computational time of the previously listed functions on the differently-split distributed Dataframes. The results for the total time of computation are:\n",
+    "\n",
+    "|Blocksize (MB)|64|50|40|30|20|10|\n",
+    "|-|-|-|-|-|-|-|\n",
+    "|Time (s)|74.8|76.4|68.8|64.2|68.2|72.8|\n",
+    "\n",
+    "As we learn from the table it looks like the best blocksize to consider is 30 MB; we will try to use this one going forward.\n",
+    "\n",
+    "After doing an operation that reduces the size of a Dataframe we would like to repartition it to keep the preferred blocksize but to do so we need to use the `df.repartition` function that asks for the `npartitions` argument. This needs to be calculated with the formula `size//blocksize` which needs to know the size of the Dataframe. The `df.size.compute()` operation takes a few seconds and not in all cases the time spent this way is gained back by faster computational times.\n",
+    "\n",
+    "**NON SO BISOGNA VEDERE BENE**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Task 1 - Anomaly detection ###"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Distributed Analysis for Anomaly Detection:**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As already mentioned above, we have defined an anomaly to occur when the period of time in which an engine stays in a state is 1 minute or less. \n",
+    "\n",
+    "After loading the whole dataframe, for each of the 4 hardwares, we study the state and anomaly of each motor over time. In particular, the  `get_norm_val_anom` function is called first in order to:\n",
+    "- Build the anomaly value for each record in the selected dataframe;\n",
+    "- Perform the normalization on the dataframe for values in the same minute (taking the `max` value for both the state and anomaly value);\n",
+    "- Fill the dataframe with the missing time records.\n",
+    "\n",
+    "Below the anomalies for each combination of hardware and engine over time are depicted:"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN065-117.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN065-118.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN065-169.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN065-170.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN088-117.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN088-118.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN088-169.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN088-170.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN106-117.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN106-118.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN106-169.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN106-170.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN115-117.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN115-118.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN115-169.jpg)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( anomalies/AN115-170.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For the sake of clarity, we also distinguish the anomalies between:\n",
+    "- The instances of one single isolated uptime or downtime;\n",
+    "- The instances which have uptimes or downtimes lasting between 30 seconds and 1 minute;\n",
+    "- The instances which have uptimes or downtimes lasting less than 30 seconds.\n",
+    "\n",
+    "This is done to see if there is a disparity between these scenarios that can highlight a trend that should be taken into consideration.  \n",
+    "\n",
+    "We report here four tables of the anomalies divided in this way:\n",
+    "|         SW-065       | S117 | S118 | S169 | S170 | \n",
+    "|----------------------|------|------|------|------|\n",
+    "| single               | 0    | 0    | 0    | 0    |\n",
+    "| between 30 sec and 1 min | 2    | 0    | 1    | 0    |\n",
+    "| < 30sec              | 2    | 0    | 0    | 0    | \n",
+    "\n",
+    "<br>\n",
+    "\n",
+    "|         SW-088       | S117 | S118 | S169 | S170 | \n",
+    "|----------------------|------|------|------|------|\n",
+    "| single               | 0    | 0    | 0    | 0    |\n",
+    "| between 30 sec and 1 min | 56    | 2    | 24    | 6    |\n",
+    "| < 30sec              | 40    | 4    | 16    | 8    |\n",
+    "\n",
+    "<br>\n",
+    "\n",
+    "|         SW-106       | S117 | S118 | S169 | S170 | \n",
+    "|----------------------|------|------|------|------|\n",
+    "| single               | 0    | 0    | 0    | 0    |\n",
+    "| between 30 sec and 1 min | 32    | 3    | 24    | 2    |\n",
+    "| < 30sec              | 26    | 3    | 21    | 7    |\n",
+    "\n",
+    "<br>\n",
+    "\n",
+    "|         SW-115       | S117 | S118 | S169 | S170 | \n",
+    "|----------------------|------|------|------|------|\n",
+    "| single               | 0    | 0    | 0    | 0    |\n",
+    "| between 30 sec and 1 min | 218    | 13    | 165    | 20    |\n",
+    "| < 30sec              | 120    | 4    | 128    | 2    |\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The first thing to notice is that for each hardware we don't have anomalies due to single isolated uptime or downtime.\n",
+    "\n",
+    "Second of all, motors S117 and S169 and motors S118 and S170 show similar behaviours: from the graphs we can see that S117 and S169 have a high number of anomalies compared to S118 and S170. \n",
+    "\n",
+    "Additionally, among the hardwares, SW-065 seems to be the one least prone to anomalies, while SW-115 the one most prone.\n",
+    "\n",
+    "\n",
+    "Due to this variability in terms of number of anomalies, we expect to have more correlations between the states of the engines and the metrics for those hardware having a significant amount of anomalies; this is exactly what it is obtained in the next section."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Correlations Analysis**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The correlations of the four engines with the above-mentioned combinations of the metrics have been studied for each hardware.\n",
+    "To begin with, we compute the global correlations between the states of the engines and the metrics. \n",
+    "\n",
+    "Here's an example:\n",
+    "\n",
+    "|        Hardware     | Engine | Metric | Pearson | Spearman | Kendall | \n",
+    "|----------------------|------|------|------|------|------|\n",
+    "|  SW-088               | S117    | S112     | 0.0049    | 0.0050    | 0.0050    |\n",
+    "\n",
+    "<br>\n",
+    "This is a simple example, but in general we see that all the coefficients have similar values and are always smaller than 3%, which underlines the absence of global correlations between the engines and the metrics.\n",
+    "\n",
+    "Proceeding with the local correlation analysis, we set the size of the time window around the anomaly to 101 minutes (centered in the anomaly, so 50 minutes before and 50 after); we expect this to be a reasonable choice to see if correlations arise, being a good trade-off for the physical meaning of the metrics.\n",
+    "\n",
+    "The analysis of correlation coefficients for some metrics returns a 'NaN' value: this is due to the metric being constant within the interval around the anomaly (the algorithm performs a division by 0). Thus, before displaying the results, we remove the combinations that return a  'NaN' value for the correlation coefficients (usually this happens for binary metrics that describe the state of a sensor).\n",
+    "\n",
+    "For all the combinations of hardwares and engines (except those that don't present anomalies), we display below the correlation coefficients for the different anomalies for each possible metric. This is done in order to analyze whether different metrics are related to different subsets of anomalies and/or if specific patterns can arise.\n",
+    "However, plotting around 40 metrics for each graph doesn't make the results clear, as it can be seen below. "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/ALL-forReport.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For this reason, we only select the most significant metrics. A good correlation coefficient is between 0.5 and 1 (in absolute value); thus, a good strategy to reduce the number of metrics being studied is to consider only those having the mean of the correlation coefficient within that range (in absolute value). However, due to fluctuations in the coefficients, we choose a smaller threshold of 0.4 in order to take into account metrics that could be correlated only with a subset of anomalies.\n",
+    "\n",
+    "Anyways, we show also the plot taking into account all the metrics for all the combinations which present some patterns common to all the metrics (those not significant are not shown).\n",
+    "\n",
+    "Moreover, we plot only Pearson's and Spearman's coefficients since Kendall coefficient returns always a value close to Spearman's."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-065, Engine S117**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE065117.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP065117.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In both the Pearson and Spearman plot, we see that the metric S73 (Compressor ON C1) has a good correlation coefficient, most of the times over 0.6. Hence, the state of this metric is probably correlated to the anomalies. A similar behaviour is seen for metric S109 (Discharge temperature), even though, in this case, we have a continuous metric, which means that the behaviour of the temperature near the anomalies is probably correlated to them. The metric S100 (Suction Pressure Cooling mode Circ 1) seems slightly anti-correlated to the state of the engine."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-065, Engine S118**\n",
+    "\n",
+    "No anomalies are detected."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-065, Engine S169**\n",
+    "\n",
+    "No significative metrics are present for this combination of hardware and engine."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-065, Engine S170**\n",
+    "\n",
+    "No anomalies are detected."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-088, Engine S117**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/ALL-PE088117.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The graph depicts all the metrics: as we can see, there are some regions (at least one broad on the left and two narrow on the right) for which most of correlation coefficients are in absolute value near 1. These general patterns suggest that those anomalies have an effect on the overall functioning of the hardware or viceversa. A good idea for a more deep analysis would be to zoom in these regions and study in more detail the behaviour of all the metrics. "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE088117.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP088117.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In both the Pearson and Spearman plots we see that the metrics S73 (Compressor ON C1), S5 (Current Power Steps) and S126 (Pressure Ratio Circ 1) have a good correlation coefficient, even thought an higher value for the coefficient is in corrispondence of the three regions underlined before. Only for Pearson we obtain good correlation values for the metrics S109 (Discharge temperature), S100 (Suction Pressure Cooling mode Circ 1) and S107 (Liquid temperature).\n",
+    "Comparing the results obtained for hardware SW-065, regarding the same engine S117, we obtain in both cases a good correlation for metric S73, and a slightly weaker correlation for metric S100."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-088, Engine S118**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE088118.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP088118.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this case, we have few anomalies, with Pearson and Spearman coefficients yielding almost the same results. The metric that displays good correlation coefficients is S100 (Suction Pressure Cooling mode Circ 1), while a slightly weaker correlation is provided for metrics S109 (Discharge Temperature) and S107 (Liquid temperature)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-088, Engine S169**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE088169.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP088169.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this case, we have no significant correlations because the values of the coefficients fluctuate too much."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-088, Engine S170**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE088170.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP088170.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The Pearson and Spearman analysis provide almost the same results, and common considerations can be drawn. A very good correlation is displayed for the metric S178 (Signal Inverter Fan Circ 2), while S205 (Status Driver Module 2 Circ 2) and S206 (Status Driver Module 3 Circ 2) are pretty good anti-correlated metrics."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-106, Engine S117**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE106117.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP106117.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this case, we have no significant correlations because the values of the coefficients for the metric S73 fluctuate too much. Similar high values are displayed only in the central region, but further analyses need to be carried out to understand if anomalies in that region imply a strong correlation."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-106, Engine S118**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE106118.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP106118.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In both the Pearson and Spearman plot we see that the metrics S73 (Compressor ON C1), S5 (Current Power Steps) and S100 (Suction Pressure Cooling mode Circ 1) have a good correlation coefficient, expecially for the first four anomalies."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-106, Engine S169**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/ALL-PE106169.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The graph depicts all the metrics: as we can see there is one region on the right, in which some metrics provide high values for the correlation coefficients, and a similar behaviour in general. A good idea for a more deep analysis would be to zoom in this region and study in more detail the behaviour of all the metrics. \n",
+    "\n",
+    "Despite this, there aren't metrics showing significant correlation coefficients."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-106, Engine S170**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE106170.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP106170.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The Pearson and Spearman analyses provide almost the same results. Good correlation coefficients are found for the metrics S130 (Compressor ON C2) which for the first anomalies stays at values around 1, and by the metric S5 (Corrent Power Steps), which stays stable between ~0.5 and 0.75."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-115, Engine S117**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE115117.png )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP115117.png )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this case, we have no significant correlations because the values of the coefficients for the metric S73 fluctuate too much for both Pearson and Spearman analyses."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-115, Engine S118**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE115118.png )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP115118.png )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For both Pearson and Spearman analyses, the metrics S5 and S73 provide high correlation coefficients, while all the other metrics have more fluctuating behaviours. Moreover, they all provide high values in the central region between the anomalies 10 and 12. Further analyses in this region need to be performed."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-115, Engine S169**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE115169.png )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/SP115169.png )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this case, we have no significant correlations because the values of the coefficients for the metric S130 fluctuate too much for both Pearson and Spearman analyses."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Hardware SW-115, Engine S170**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE115170.png )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text]( images/PE115170.png )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The Pearson and Spearman analyses provide almost the same results, thus common considerations can be drawn. The metrics S130 and S5 provide very high correlation coefficients near 1, and S205 and S157 very high anti-correlation coefficients near -1. Moreover the metrics S159 and S164 have coefficients under the value 0.5 for the first and last anomalies, while they are above 0.5 in the central region, underlying a good correlation."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In summary, the metrics that seem to be correlated with at least one engine are: \n",
+    "- S73: Compressor ON C1\n",
+    "- S100: Suction Pressure Cooling Mode Circ 1\n",
+    "- S178: Signal Inverter Fan Circ 2\n",
+    "- S205: Status Driver Module 2 Circ 2\n",
+    "- S206: Status Driver Module 3 Circ 2\n",
+    "- S5: Corrent Power Steps\n",
+    "- S130: Compressor ON C2\n",
+    "- S157: Suction Pressure Cooling Mode Circ 2\n",
+    "\n",
+    "while slight correlations seem to appear for the metrics:\n",
+    "- S109: Discharge Temperature C1,1\n",
+    "- S107: Liquid Temperature Circ 1\n",
+    "- S159: Discharge Pressure Circ 2\n",
+    "- S164: Liquid Temperature Circ 2\n",
+    "\n",
+    "\n",
+    "Once the anomalies correlations for each combination of hardware and engine has been studied with respect to all the possible metrics, it is interesting to analyse whether or not specific patterns can arise for a single hardware, or a single engine. In particular:\n",
+    "- Engine S117 seems to be more correlated with the metric S73, which is probably a flag for the compressor being ON on circuit 2\n",
+    "- Engine S118 seems to be more correlated with the metric S73, as before; the metric S5, which could refer to phases in a workflow related to power; the metric S100 which could refer to the pressure of the refrigerant on the suction side of a compressor in the cooling operational mode.\n",
+    "- Engine S169 seems to be uncorrelated with the metrics, under our analysis it.\n",
+    "- Engine S170 seems to be correlated with the metric S205, which refers to the second driver module of circuit 2 (driver modules are electronic components that control and power other parts of a system, such as motors, thus, it can be reasonable to find correlations with this metric. Also, for hardware SW-088 there is correlation with S206 which refers to the third driver module); the metric S130, which probably refers to a flag for the compressor being ON on circuit 2; the metric S5, already explained.\n",
+    "\n",
+    "Additionally, as anticipated in the previous section, the hardware SW-065 seems to be uncorrelated with the metrics, probably due to the small number of anomalies that the motors have. On the other hand, hardware SW-115 is the one providing more correlations with the metrics, again probably due to the big amount of anomalies that it has.\n",
+    "\n",
+    "Further analyses can be performed using two approaches:\n",
+    "- First, it is possible to zoom in the regions of interest where good correlations with the metrics are observed in order to gain more information on the desired engine. \n",
+    "- Secondly, the correlations can be analyzed with respect to the time occurence of the anomalies. In our analysis, in fact, the correlation behaviours are only plotted as functions of the number of anomalies, thus losing all their time information: for example whether anomalies of consecutive indices are near or far away from each other in terms of time.\n",
+    "\n",
+    "Finally, additional insights can be obtained looking for correlations between metrics and the union of the anomalies of different engines for the same hardware. For example, it is possible to perform the union of anomalies of engines belonging to the same circuit, in order to study possible correlations with circuit-specific metrics. The same concept can be applied to the correlations with circuit-independent metrics, where the union of the anomalies of all the engines can be considered."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Task 2 - Anomaly Detection 2 ###"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Each device in the dataset contains 4 engines responsible for compressing gas to either chill or heat the environment. An abnormal value in the working/loading percentage of these units could indicate a failure in the device, thus it's imperative to monitor them. Two metrics represent the load percentage, S125 and S181, respectively for Circuit 1 and Circuit 2. \n",
+    "Here we study the behaviour of the load of the two circuits and, subsequently, we look for correlations between these two metrics and the external temperature, stored in S41."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "| Hardware | Metric | Active time (hours) |Active time (%)| Max measured capacity (%) | Max capacity time (hours) |Max capacity time (%) | \n",
+    "|------|--------|-------|-|------------|------|-|\n",
+    "| SW-065 | S125        | 923.8333333333334 |36.83227791325842    | 100.0    | 2.5833333333333335 |0.1029948236795067    | \n",
+    "| SW-065 | S181       | 921.5333333333333 |36.74057929604699   | 100.0    | 1.6333333333333333 |0.06511930787478487    | \n",
+    "| SW-088 | S125        | 1428.266666666666 |32.698412698412696    | 100.0    | 532.1333333333333 |12.182539682539682    | \n",
+    "| SW-088 | S181       | 785.5333333333333 |17.983821733821735    | 100.0    | 128.36666666666667 |2.938797313797314    | \n",
+    "| SW-106 | S125       | 3316.9333333333334 |77.94492595827343    | 100.0    | 24.166666666666668 |0.5678947553940211    | \n",
+    "| SW-106 | S181       | 3338.55 |78.45289802568452    | 100.0    | 27.65 |0.6497499304818488    | \n",
+    "| SW-115 | S125       | 1478.55 |33.84971707004376    | 100.0    | 307.28333333333336 |7.034901689948452    | \n",
+    "| SW-115 | S181       | 1502.8166666666666 |34.405274745401194    | 100.0    | 304.5 |6.971180445590833    |  "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As can be seen from the table above, both circuits in every hardware reach full capacity. However, for hardwares SW-065 and SW-106, both circuits stay at full capacity for less than 1% of the time. In particular, SW-065 stays at maximum capacity for less than 3 hours and this could be a sign of over-dimensioning for that hardware. On another note, we can also notice how, in hardware SW-088, Circuit 2 is active roughly half of the time of Circuit 1; this could indicate a under-usage of this part of the hardware."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Correlations Analysis**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In the table below we show the value of the Pearson, Spearman and Kendall correlation coefficients between metrics S125 or S181 (Circuits capacities) and S41 (external temperature) for each hardware:"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "| Hardware | Metrics | Pearson |Spearman | Kendall | \n",
+    "|-----------|---------|---------|---------|---------|\n",
+    "| SW-065   | S41 and S125     | 0.554828 |0.554828    | 0.468981 |\n",
+    "| SW-065   | S41 and S181    | 0.582359 | 0.607087    | 0.486966 |\n",
+    "| SW-088 | S41 and S125    | -0.523576 | -0.522972    | -0.415214 |\n",
+    "| SW-088    | S41 and S181    | -0.235379 | -0.205716    | -0.16674|\n",
+    "| SW-106   | S41 and S125    | -0.263049 |-0.263051   | -0.221489 |\n",
+    "| SW-106    | S41 and S181    | -0.258935 |-0.258607   | -0.219502|\n",
+    "| SW-115   | S41 and S125    | -0.254451 |-0.234384   |-0.181271|\n",
+    "| SW-115   | S41 and S181    | -0.272938 |-0.251762    |-0.19513 |"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "A value of the coefficient (for all three correlation metrics) higher than 0.5 indicates a strong correlation. Therefore, we can say that it is present a strong correlation between the circuits capacities and the external temperature in hardware SW-065 and between circuit 1 capacity and external temperature in hardware SW-088, at least concerning Pearson and Spearman correlation metrics."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Here we report the plots of the studied metrics where a strong correlation was found (first 3 plots) and one where it was not (last plot):"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![SW-065_S125_plot.png](images/SW-065_S125_plot.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![SW-065_S181_plot.png](images/SW-065_S181_plot.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![SW-088_S125_plot.png](images/SW-088_S125_plot.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![SW-088_S181_plot.png](images/SW-088_S181_plot.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "A consideration can be drawn from, at least, the first two plots (i.e. the ones regarding hardware SW-065): there is a suddent drop in temperature in correspondence with the working load percentage dropping to zero. This observed behaviour suggests that the hardware stopped working because a certain temperature threshold was reached or, on the other hand, the hardware stopped working and that caused a drop in the external temperature. \n",
+    "\n",
+    "It has to be noted that since we have no information regarding the function of these hardwares, these conclusion are just hypothesis and we are not even able to say if the correlation we see between these two metrics is a sign of a causal relation. "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Task 3 - Predictive Maintenace ###"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Conversion of alarms**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "After the conversion of the alarms from the integer representation to the 16 binary values, we study how many faults we observe for each hardware. It turns out that only one hardware, SW-088, presents faults, while the other don't, so they seems working fine (at least regarding the overheating controlled by columns 6, 7, 8 of the alarms). For this device we study when the columns 6, 7, 8 present value 1 in order to see later if the fault is correlated with other metrics. The following table sums up the values for both alarm A5 and A9 of device SW-088.\n",
+    "\n",
+    "| Alarm 5  | Number of faults |\n",
+    "|----------|------------------|\n",
+    "| Column 6 | 0                |\n",
+    "| Column 7 | 30               |\n",
+    "| Column 8 | 2                |\n",
+    "| Faults   | 30               |\n",
+    "\n",
+    "<br>\n",
+    "\n",
+    "| Alarm 9  | Number of faults |\n",
+    "|----------|------------------|\n",
+    "| Column 6 | 0                |\n",
+    "| Column 7 | 95               |\n",
+    "| Column 8 | 7                |\n",
+    "| Faults   | 102              |\n",
+    "\n",
+    "As we can see for alarm 5, column 6 never presents value 1, while column 7 is always 1 when a fault occurs (the only two times column 8 is 1 also column 7 is 1). Thus, for the correlation analysis, we can simply considered the faults without differentiating which column is 1.\n",
+    "\n",
+    "For alarm 9, we still have that column 6 never presents value 1, and 95/102 times that a fault is present, column 7 has value 1 (so this column is the one that gives most information about faults in general); differently from before, we have 7/102 cases in which only column 8 presents value 1, so we decided to study 3 correlation conditions, considering only column 7, only column 8 and then the total faults.  "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Correlation analysis**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For the correlation analysis we consider the external metrics for both A5 and A9 and then circuit-specific metrics (A5 refers to circuit 1, while A9 refers to circuit 2) which are not always constant (and thus cannot yield any correlation). The correlation techniques we use are Pearson, Spearman and Kendall coeffiecients; most of the times they yield very similar results, so only Pearson coefficient correlation plots are depicted.\n",
+    "\n",
+    "This time we don't study a global correlation between alarms and metrics but only local correlations, considering a 31 minutes window (15 before and 15 after the occurrence of the fault). Moreover we analyze different shifts (from 0 to 30 minutes, every 5 minutes), in order to see if there exist a causal relation between the behaviour of a metric and the following occurrence of a fault. This value has been chosen because if we are considering physical quantities like the external temperature, the change in their behaviour and the subsequent fault could be several minutes away."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Starting with alarm 5, we represent the correlation plots:"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text](images/A5_fault_shift0.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text](images/A5_fault_shift5.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text](images/A5_fault_shift10.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text](images/A5_fault_shift15.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text](images/A5_fault_shift20.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text](images/A5_fault_shift25.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt text](images/A5_fault_shift30.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "As we can see none of the plots presents a good correlation behaviour, from which we can deduce that no correlation (of the kind studied) exists between metrics behaviour and alarm. Moreover we see that the only plot that manifests some \"good\" correlation coefficients (in this case this means > 0.5 in absolute value in some regions) is the one at shift 0; this probably means that if a correlation exist, it is present for smaller values of the shift (between 0 and 5 minutes)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For alarm 9 we obtained the same conclusion as for alarm 5 regarding the value of the shift; thus, we present only the graphs at shift 0 for the correlation of column 7, of column 8 and of the total faults. "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt txt]( images/A9_7_shift0.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt txt]( images/A9_8_shift0.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![alt txt]( images/A9_fault_shift0.png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Also in this case the plots produced don't show a correlation pattern that can help us finding a correlation between metrics and faults. We also notice that conducting different correlation analysis for column 7 and 8 produces slightly different graphs from the faults correlation analysis, so we can conclude that it's enough to study the total faults also in this case without giving importance to which column has value 1. Nevertheless, from this analysis no significant correlations have been found. "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Predictive modeling**"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "From the correlation analysis presented above, no correlation has been found; thus we can't produce a predictive model that can help us predict future faults on the basis of the behaviour of some metrics."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "This indicates the necessity of further study, in order to understand if these faults are correlated to something that we were not able to find. In particular, possible continuation of this study can be:\n",
+    "- choosing a different time window for the correlation coefficients (probably smaller, in order to study more local correlations).\n",
+    "- studying shifts between 0 and 5 minutes, which from the analysis seems the time region were the correlations are more evident.\n",
+    "- changing the correlation techniques used for the analysis. It is possible that these coefficients try to find a more deep correlation than what exists in reality: for example, if an alarm has value 1 simply when the external temperature reaches a certain value, with no regard to its behaviour near that specific point, then correlation techniques like those we used can't find anything as they look for a general correlation and not correlations of a single point.\n",
+    "\n",
+    "More insights on possible correlations can be gained with a more exhaustive knowledge of what the metrics represent and how they are related to each circuit and engine. "
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "base",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.12"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
